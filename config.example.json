@@ -1,0 +1,24 @@
+{
+  "//": "Copy to config.json and fill in. Environment variables override these.",
+
+  "//atlassian": "Jira MCP connection (see src/core/config.rs::JiraConfig).",
+  "atlassian_base_url": "https://mcp.atlassian.com/v1/mcp",
+  "atlassian_email": "you@example.com",
+  "atlassian_api_token": "REPLACE_WITH_API_TOKEN",
+  "jira_default_project": "PROJ",
+  "jira_cloud_id": null,
+  "jira_mcp_mock": false,
+
+  "//models": "Optional voice (Whisper) + LLM (candle) overrides.",
+  "whisper_preset": "base",
+  "whisper_language": "en",
+
+  "//llm_preset": "ministral-3b (small/fast) or mistral-7b (stronger). Download the matching model first: scripts/download-llm.sh mistral-7b",
+  "llm_preset": "ministral-3b",
+
+  "//sampling": "0 temperature = greedy; raise repeat_penalty to curb loops on small models.",
+  "temperature": 0.3,
+  "top_p": 0.9,
+  "repeat_penalty": 1.15,
+  "repeat_last_n": 64
+}
