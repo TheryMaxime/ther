@@ -50,7 +50,7 @@ pub fn AppJira() -> Element {
     let transcript = use_signal(String::new);
     let llm_response = use_signal(String::new);
     let detected_issues = use_signal(String::new);
-    let project_key = use_signal(|| "PROJ".to_string());
+    let project_key = use_signal(|| backend.jira_cfg.default_project.clone().unwrap_or_default());
     let mut input_text = use_signal(String::new);
     let proposals = use_signal(Vec::<ProposalView>::new);
 
@@ -141,9 +141,9 @@ pub fn AppJira() -> Element {
 
     let on_analyze = {
         let backend = backend.clone();
-        let transcript = transcript;
+        let llm_response = llm_response;
         let project_key = project_key;
-        move |_| backend.analyze(transcript(), project_key())
+        move |_| backend.analyze(llm_response(), project_key())
     };
 
     let recording = is_recording();
