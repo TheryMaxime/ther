@@ -1,4 +1,4 @@
-//! Dioxus port of the former `jira.slint` screen: the "Meeting to Jira Story
+//! Dioxus screen: the "Meeting to Jira Story
 //! Assistant". Owns the reactive UI state (signals) and renders the layout using
 //! the local `vtmn-play` (Vitamin Play) CSS. All backend behaviour lives in the
 //! shared [`Backend`](super::Backend); this module only reflects state and
