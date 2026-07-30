@@ -17,7 +17,7 @@ use crate::core::{Callback, LlmContext};
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a concise assistant listening to an ongoing spoken conversation. \
 Use the running summary of earlier discussion together with the most recent \
-transcript to understand the full context, then respond helpfully in one or two \
+transcript to understand the full context, then respond helpfully in \
 short sentences.";
 
 /// Prompt used to fold older transcript into a compact running summary so the
