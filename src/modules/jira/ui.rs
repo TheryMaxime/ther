@@ -68,20 +68,25 @@ pub fn AppJira() -> Element {
     // Drain backend updates into the signals. `use_hook` runs once; `spawn`
     // schedules the task on the Dioxus runtime so signal writes are valid.
     use_hook(|| {
+        let backend_cl = backend.clone();
         let mut analyzing = analyzing;
         let mut status_msg = status_msg;
         let mut transcript = transcript;
         let mut llm_response = llm_response;
         let mut detected_issues = detected_issues;
         let mut proposals = proposals;
-        let mut rx = backend.take_update_rx();
+        let mut rx = backend_cl.take_update_rx();
         spawn(async move {
             if let Some(rx) = rx.as_mut() {
                 while let Some(update) = rx.recv().await {
                     match update {
                         Update::Status(s) => status_msg.set(s),
                         Update::Transcript(s) => transcript.set(s),
-                        Update::Response(s) => llm_response.set(s),
+                        Update::Response(s) => {
+                            let key = backend_cl.jira_cfg.default_project.clone().unwrap_or_default();
+                            backend_cl.analyze(s.clone(), key);
+                            llm_response.set(s);
+                        },
                         Update::DetectedIssues(s) => detected_issues.set(s),
                         Update::Analyzing(b) => analyzing.set(b),
                         Update::Proposals(p) => proposals.set(p),
