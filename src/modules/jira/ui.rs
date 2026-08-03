@@ -155,31 +155,39 @@ pub fn AppJira() -> Element {
 
     let on_analyze = {
         let backend = backend.clone();
-        move |transcript_text: String, project: String| backend.analyze(transcript_text, project)
+        move |transcript_text: String, notes_text: String, project: String| {
+            backend.analyze(transcript_text, notes_text, project)
+        }
     };
 
-    // Auto-analyze: once the transcript (spoken or typed) grows by the configured
-    // number of characters since the last analysis, extract Jira proposals
-    // automatically — no button press required. The `analyzing` flag prevents
-    // overlapping runs; text that arrives mid-analysis is picked up on the next
-    // transcript change once analysis completes.
+    // Auto-analyze: once the assistant's running notes (the LLM's own answer,
+    // not the raw transcript) grow by the configured number of characters
+    // since the last analysis, extract Jira proposals automatically — no
+    // button press required. Keying off the notes instead of the raw
+    // transcript means extraction re-analyzes what the model has already
+    // condensed rather than re-prompting it with the full raw dialogue again.
+    // The `analyzing` flag prevents overlapping runs; text that arrives
+    // mid-analysis is picked up on the next notes change once analysis
+    // completes.
     use_effect({
         let backend = backend.clone();
         let on_analyze = on_analyze.clone();
         let transcript = transcript;
+        let llm_response = llm_response;
         let analyzing = analyzing;
         let project_key = project_key;
         let mut last_analyzed_len = last_analyzed_len;
         move || {
-            let current = transcript();
-            let len = current.len();
+            let notes = llm_response();
+            let current_transcript = transcript();
+            let len = notes.len();
             let threshold = backend.analyze_threshold();
             if !analyzing()
-                && current.trim().len() >= 20
+                && current_transcript.trim().len() >= 20
                 && len.saturating_sub(last_analyzed_len()) >= threshold
             {
                 last_analyzed_len.set(len);
-                on_analyze(current, project_key());
+                on_analyze(current_transcript, notes, project_key());
             }
         }
     });

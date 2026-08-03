@@ -6,6 +6,13 @@
 //! prompting the embedded LLM for structured change *proposals*, and applying
 //! approved proposals to Jira through the Atlassian MCP server. Nothing is
 //! written to Jira without explicit per-proposal approval.
+//!
+//! Proposal extraction is seeded from the assistant's own running-notes
+//! *answer* to the transcript (not the raw transcript itself): the LLM has
+//! already condensed the discussion once to produce that answer, so
+//! extraction re-analyzes that condensed text instead of re-prompting the
+//! model with the full raw dialogue a second time. The raw transcript is
+//! still used locally for cheap regex-based issue-key detection.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
@@ -96,8 +103,10 @@ impl Module for JiraModule {
 
 /// Headless check of the proposal-extraction path (no UI/mic/network):
 ///   JIRA_PROPOSAL_SELFTEST=1 cargo run
-/// Loads the LLM, runs the extraction prompt over a sample transcript, and
-/// prints the raw output plus the defensively-parsed proposals.
+/// Loads the LLM, first generates its running-notes answer for a sample
+/// transcript (mirroring the live pipeline), then runs the extraction prompt
+/// over those notes, and prints the raw output plus the defensively-parsed
+/// proposals.
 pub fn proposal_selftest() {
     let transcript = std::env::var("JIRA_PROPOSAL_SELFTEST_TEXT").unwrap_or_else(|_| {
         "Let's create a new story for password reset via email; users get a link \
@@ -107,23 +116,36 @@ drop the SMS step."
     });
 
     let cfg = ModelConfig::load();
-    let prompt = build_extraction_prompt(&transcript, "", "PROJ");
-    match crate::core::llm::LlmEngine::load(&cfg)
-        .and_then(|mut e| e.complete(&prompt, PROPOSAL_MAX_TOKENS))
-    {
-        Ok(raw) => {
-            println!("--- RAW MODEL OUTPUT ---\n{raw}\n------------------------");
-            let props = parse_proposals(&raw);
-            println!("Parsed {} proposal(s):", props.len());
-            for p in &props {
-                println!(
-                    "  [{}] type={} target='{}' :: {} | {}",
-                    p.action.as_str(),
-                    p.issue_type,
-                    p.target_key,
-                    p.summary,
-                    p.description
-                );
+    match crate::core::llm::LlmEngine::load(&cfg) {
+        Ok(mut engine) => {
+            let notes = match engine.generate(&transcript) {
+                Ok(notes) => {
+                    println!("--- ASSISTANT NOTES ---\n{notes}\n------------------------");
+                    notes
+                }
+                Err(e) => {
+                    eprintln!("proposal self-test failed to generate notes: {e:?}");
+                    return;
+                }
+            };
+            let prompt = build_extraction_prompt(&notes, "", "PROJ");
+            match engine.complete(&prompt, PROPOSAL_MAX_TOKENS) {
+                Ok(raw) => {
+                    println!("--- RAW MODEL OUTPUT ---\n{raw}\n------------------------");
+                    let props = parse_proposals(&raw);
+                    println!("Parsed {} proposal(s):", props.len());
+                    for p in &props {
+                        println!(
+                            "  [{}] type={} target='{}' :: {} | {}",
+                            p.action.as_str(),
+                            p.issue_type,
+                            p.target_key,
+                            p.summary,
+                            p.description
+                        );
+                    }
+                }
+                Err(e) => eprintln!("proposal self-test failed: {e:?}"),
             }
         }
         Err(e) => eprintln!("proposal self-test failed: {e:?}"),
@@ -169,7 +191,8 @@ impl Backend {
         self.update_rx.lock().unwrap().take()
     }
 
-    /// Character growth in the transcript that auto-triggers analysis.
+    /// Character growth in the assistant's running notes that auto-triggers
+    /// analysis (extraction reanalyzes the notes, not the raw transcript).
     pub fn analyze_threshold(&self) -> usize {
         self.cfg.analyze_min_new_chars
     }
@@ -220,7 +243,16 @@ impl Backend {
     }
 
     /// Detect issues under discussion and extract Jira change proposals.
-    pub fn analyze(&self, transcript: String, project_key: String) {
+    ///
+    /// `transcript` is the raw spoken/typed dialogue, used only for cheap
+    /// local regex-based issue-key detection (explicit `KEY-123` mentions can
+    /// be dropped when the LLM condenses the discussion). `notes` is the
+    /// assistant's own running-notes answer for that transcript; it is the
+    /// text actually fed into the extraction prompt, so the model re-analyzes
+    /// what it has already understood instead of being re-prompted with the
+    /// full raw transcript a second time. Falls back to `transcript` when no
+    /// notes are available yet (e.g. before the first LLM answer arrives).
+    pub fn analyze(&self, transcript: String, notes: String, project_key: String) {
         if transcript.trim().len() < 20 {
             self.emit(Update::Status("Need more transcript before analyzing.".to_string()));
             return;
@@ -236,6 +268,8 @@ impl Backend {
             keys.join(", ")
         };
         self.emit(Update::DetectedIssues(detected));
+
+        let notes = if notes.trim().is_empty() { transcript.clone() } else { notes };
 
         let this = self.clone();
         self.tokio_rt.spawn(async move {
@@ -269,7 +303,7 @@ impl Backend {
                 .default_project
                 .clone()
                 .unwrap_or_else(|| project_key.clone());
-            let prompt = build_extraction_prompt(&transcript, &issue_context, &default_project);
+            let prompt = build_extraction_prompt(&notes, &issue_context, &default_project);
 
             // Ask the LLM worker for a structured completion and await its reply.
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<String>();

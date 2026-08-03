@@ -104,9 +104,12 @@ pub fn similarity_score(a: &Proposal, b: &Proposal) -> f32 {
 
 /// Build the strict-JSON extraction prompt for the LLM.
 ///
-/// `issue_context` carries any known detail about issues currently under
-/// discussion (fetched from Jira) so updates target the right issue.
-pub fn build_extraction_prompt(transcript: &str, issue_context: &str, default_project: &str) -> String {
+/// `notes` is the assistant's own running-notes answer for the discussion so
+/// far (not the raw transcript): extraction re-analyzes what the model has
+/// already understood/condensed instead of re-prompting it with the full raw
+/// dialogue. `issue_context` carries any known detail about issues currently
+/// under discussion (fetched from Jira) so updates target the right issue.
+pub fn build_extraction_prompt(notes: &str, issue_context: &str, default_project: &str) -> String {
     let context_block = if issue_context.trim().is_empty() {
         "(no existing issues resolved yet)".to_string()
     } else {
@@ -133,8 +136,8 @@ Example output:\n\
 \"summary\":\"Add password reset via email\",\"description\":\"Users request a reset \
 link by email that expires after one hour.\",\"acceptance_criteria\":\"Link expires in 1h; \
 one active link per user.\",\"rationale\":\"Team agreed users need self-service reset.\"}}]}}\n\n\
-Transcript:\n{transcript}\n\n\
-Now output the JSON object for this transcript: [/INST]\n{PROPOSAL_PRIME}"
+Assistant's running notes so far:\n{notes}\n\n\
+Now output the JSON object for these notes: [/INST]\n{PROPOSAL_PRIME}"
     )
 }
 
