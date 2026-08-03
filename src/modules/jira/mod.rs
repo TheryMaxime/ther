@@ -15,9 +15,9 @@ use tokio::runtime::Runtime;
 
 use super::Module;
 use crate::core::config::{JiraConfig, ModelConfig};
-use crate::core::llm::{self, LlmMessage};
+use crate::core::llm::{self, LlmRequest};
 use crate::core::stt::Recorder;
-use crate::core::{Callback, LlmContext};
+use crate::core::{EventSender, LlmContext};
 
 use dioxus::desktop::{Config, WindowBuilder};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -130,8 +130,13 @@ pub struct Backend {
     jira_client: Arc<tokio::sync::Mutex<Option<JiraClient>>>,
     items: Arc<Mutex<Vec<ProposalItem>>>,
     next_id: Arc<AtomicI32>,
-    llm_tx: mpsc::Sender<LlmMessage>,
-    raw_tx: mpsc::Sender<String>,
+    /// Typed request channel into the embedded LLM worker.
+    llm_tx: mpsc::Sender<LlmRequest>,
+    /// Shared event sink handed to core services (STT, LLM) for status /
+    /// transcript / response updates.
+    events: EventSender,
+    /// UI-facing update channel (core events are adapted into it, plus the
+    /// Jira-specific proposal/analyze updates the Backend emits directly).
     update_tx: UnboundedSender<Update>,
     update_rx: Arc<Mutex<Option<UnboundedReceiver<Update>>>>,
 }
@@ -146,25 +151,9 @@ impl Backend {
         self.update_rx.lock().unwrap().take()
     }
 
-    fn status_cb(&self) -> Callback {
-        let tx = self.update_tx.clone();
-        Box::new(move |text| {
-            let _ = tx.send(Update::Status(text));
-        })
-    }
-
-    fn transcript_cb(&self) -> Callback {
-        let tx = self.update_tx.clone();
-        Box::new(move |text| {
-            let _ = tx.send(Update::Transcript(text));
-        })
-    }
-
-    fn response_cb(&self) -> Callback {
-        let tx = self.update_tx.clone();
-        Box::new(move |text| {
-            let _ = tx.send(Update::Response(text));
-        })
+    /// Character growth in the transcript that auto-triggers analysis.
+    pub fn analyze_threshold(&self) -> usize {
+        self.cfg.analyze_min_new_chars
     }
 
     /// Push the current proposal list into the UI.
@@ -180,9 +169,8 @@ impl Backend {
         Recorder::start(
             self.cfg.whisper_model_path.clone(),
             self.cfg.whisper_language.clone(),
-            self.transcript_cb(),
-            self.status_cb(),
-            self.raw_tx.clone(),
+            self.events.clone(),
+            self.llm_tx.clone(),
         )
     }
 
@@ -200,7 +188,7 @@ impl Backend {
         };
         self.emit(Update::Transcript(combined.clone()));
         self.emit(Update::Status("Assistant thinking...".to_string()));
-        let _ = self.raw_tx.send(combined);
+        let _ = self.llm_tx.send(LlmRequest::Transcript(combined));
     }
 
     /// Detect issues under discussion and extract Jira change proposals.
@@ -234,63 +222,69 @@ impl Backend {
                 .unwrap_or_else(|| project_key.clone());
             let prompt = build_extraction_prompt(&transcript, &issue_context, &default_project);
 
-            // Deliver extraction result: parse -> populate review list ->
-            // resolve update targets against the project.
-            let reply: Callback = {
-                let this = this.clone();
-                let project_key = project_key.clone();
-                Box::new(move |raw: String| {
-                    let parsed = parse_proposals(&raw);
-                    let mut new_items: Vec<ProposalItem> = parsed
-                        .into_iter()
-                        .map(|p| ProposalItem {
-                            id: this.next_id.fetch_add(1, Ordering::SeqCst),
-                            proposal: p,
-                            status: "pending".to_string(),
-                            result: String::new(),
-                        })
-                        .collect();
-
-                    let count = new_items.len();
-                    {
-                        let mut guard = this.items.lock().unwrap();
-                        guard.append(&mut new_items);
-                    }
-                    this.render_proposals();
-
-                    // For any UPDATE whose target key is unknown, search the
-                    // project for the existing issue and fill it in.
-                    let this = this.clone();
-                    let project_key = project_key.clone();
-                    let rt = this.tokio_rt.clone();
-                    rt.spawn(async move {
-                        let matched = resolve_update_targets(
-                            &this.jira_client,
-                            &this.jira_cfg,
-                            &project_key,
-                            &this.items,
-                        )
-                        .await;
-                        this.render_proposals();
-
-                        this.emit(Update::Analyzing(false));
-                        let extra = if matched > 0 {
-                            format!(" ({matched} update target(s) matched)")
-                        } else {
-                            String::new()
-                        };
-                        this.emit(Update::Status(format!(
-                            "{count} proposal(s) ready for review.{extra}"
-                        )));
-                    });
+            // Ask the LLM worker for a structured completion and await its reply.
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<String>();
+            if this
+                .llm_tx
+                .send(LlmRequest::Complete {
+                    prompt,
+                    max_new_tokens: PROPOSAL_MAX_TOKENS,
+                    reply: reply_tx,
                 })
+                .is_err()
+            {
+                this.emit(Update::Analyzing(false));
+                this.emit(Update::Status("LLM worker unavailable.".to_string()));
+                return;
+            }
+            let raw = match reply_rx.await {
+                Ok(raw) => raw,
+                Err(_) => {
+                    this.emit(Update::Analyzing(false));
+                    this.emit(Update::Status("LLM worker stopped before replying.".to_string()));
+                    return;
+                }
             };
 
-            let _ = this.llm_tx.send(LlmMessage::Complete {
-                prompt,
-                max_new_tokens: PROPOSAL_MAX_TOKENS,
-                reply,
-            });
+            // Parse -> populate the review list.
+            let parsed = parse_proposals(&raw);
+            let mut new_items: Vec<ProposalItem> = parsed
+                .into_iter()
+                .map(|p| ProposalItem {
+                    id: this.next_id.fetch_add(1, Ordering::SeqCst),
+                    proposal: p,
+                    status: "pending".to_string(),
+                    result: String::new(),
+                })
+                .collect();
+
+            let count = new_items.len();
+            {
+                let mut guard = this.items.lock().unwrap();
+                guard.append(&mut new_items);
+            }
+            this.render_proposals();
+
+            // For any UPDATE whose target key is unknown, search the project for
+            // the existing issue and fill it in.
+            let matched = resolve_update_targets(
+                &this.jira_client,
+                &this.jira_cfg,
+                &project_key,
+                &this.items,
+            )
+            .await;
+            this.render_proposals();
+
+            this.emit(Update::Analyzing(false));
+            let extra = if matched > 0 {
+                format!(" ({matched} update target(s) matched)")
+            } else {
+                String::new()
+            };
+            this.emit(Update::Status(format!(
+                "{count} proposal(s) ready for review.{extra}"
+            )));
         });
     }
 
@@ -409,19 +403,20 @@ fn run_app(llm_ctx: LlmContext) -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(tokio::sync::Mutex::new(None));
 
     // Live transcript (from the recorder) is forwarded into the LLM worker as
-    // `LlmMessage::Transcript`; proposal extraction is sent as `LlmMessage::Complete`.
-    let (raw_tx, raw_rx) = mpsc::channel::<String>();
-    let (llm_tx, llm_rx) = mpsc::channel::<LlmMessage>();
+    // `LlmRequest::Transcript`; proposal extraction is sent as `LlmRequest::Complete`.
+    let (llm_tx, llm_rx) = mpsc::channel::<LlmRequest>();
 
-    // Background -> UI updates, drained by the Dioxus component.
+    // Typed core-event bus (STT + LLM services -> UI) and the module's UI-update
+    // channel drained by the Dioxus component.
+    let (events, mut core_rx) = crate::core::bus::channel();
     let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel::<Update>();
 
     {
-        // Forward raw transcript snapshots into the multiplexed worker channel.
-        let llm_tx = llm_tx.clone();
-        std::thread::spawn(move || {
-            for text in raw_rx {
-                if llm_tx.send(LlmMessage::Transcript(text)).is_err() {
+        // Adapt core events into the UI's update stream (single hub, one hop).
+        let update_tx = update_tx.clone();
+        tokio_rt.spawn(async move {
+            while let Some(event) = core_rx.recv().await {
+                if update_tx.send(Update::from(event)).is_err() {
                     break;
                 }
             }
@@ -436,18 +431,12 @@ fn run_app(llm_ctx: LlmContext) -> Result<(), Box<dyn std::error::Error>> {
         items,
         next_id,
         llm_tx,
-        raw_tx,
+        events: events.clone(),
         update_tx,
         update_rx: Arc::new(Mutex::new(Some(update_rx))),
     };
 
-    llm::spawn_worker(
-        llm_rx,
-        cfg,
-        llm_ctx,
-        backend.response_cb(),
-        backend.status_cb(),
-    );
+    llm::spawn_worker(llm_rx, cfg, llm_ctx, events);
 
     // Custom desktop window configuration.
     let window_config = Config::new().with_window(

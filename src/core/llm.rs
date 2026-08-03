@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokenizers::Tokenizer;
 
 use crate::core::config::ModelConfig;
-use crate::core::{Callback, LlmContext};
+use crate::core::{EventSender, LlmContext};
 
 /// Default assistant instruction, used when a module supplies no system prompt.
 const DEFAULT_SYSTEM_PROMPT: &str =
@@ -31,20 +31,20 @@ sentences at most); preserve decisions, action items, names, dates and numbers."
 /// Extra tokens reserved for prompt scaffolding (INST markers, system prompt, labels).
 const SCAFFOLD_RESERVE: usize = 96;
 
-/// Messages accepted by the background LLM worker.
+/// Requests accepted by the background LLM worker.
 ///
 /// The worker multiplexes two jobs on the single embedded engine: streaming
 /// answers to live transcript snapshots, and one-off structured completions
 /// (e.g. Jira proposal extraction) requested on demand by a module.
-pub enum LlmMessage {
+pub enum LlmRequest {
     /// A new transcript snapshot to (eventually) answer.
     Transcript(String),
     /// A one-off completion from a fully-built prompt. The result is delivered
-    /// via `reply`; the live-answer state (summary, debounce) is left untouched.
+    /// on `reply`; the live-answer state (summary, debounce) is left untouched.
     Complete {
         prompt: String,
         max_new_tokens: usize,
-        reply: Callback,
+        reply: tokio::sync::oneshot::Sender<String>,
     },
 }
 
@@ -370,24 +370,23 @@ Recent transcript:\n{recent} [/INST]"
 ///      rolling `summary` of the older transcript so the model effectively sees
 ///      the whole conversation, not just the tail that fits in the window.
 pub fn spawn_worker(
-    rx: Receiver<LlmMessage>,
+    rx: Receiver<LlmRequest>,
     cfg: ModelConfig,
     ctx: LlmContext,
-    on_response: Callback,
-    on_status: Callback,
+    events: EventSender,
 ) {
     std::thread::spawn(move || {
-        on_status("Loading LLM (first run may download the model)...".to_string());
+        events.status("Loading LLM (first run may download the model)...");
 
         let mut engine = match LlmEngine::load(&cfg) {
             Ok(e) => e,
             Err(e) => {
-                on_status(format!("LLM unavailable: {e}"));
+                events.status(format!("LLM unavailable: {e}"));
                 return;
             }
         };
         engine.set_system_prompt(ctx.effective_prompt());
-        on_status("LLM ready.".to_string());
+        events.status("LLM ready.");
 
         let debounce = Duration::from_millis(cfg.debounce_ms);
         let min_chars = cfg.min_chars;
@@ -422,22 +421,23 @@ pub fn spawn_worker(
             };
 
             match received {
-                Some(LlmMessage::Complete {
+                Some(LlmRequest::Complete {
                     prompt,
                     max_new_tokens,
                     reply,
                 }) => {
-                    on_status("Analyzing transcript...".to_string());
-                    match engine.complete(&prompt, max_new_tokens) {
-                        Ok(out) => reply(out),
+                    events.status("Analyzing transcript...");
+                    let out = match engine.complete(&prompt, max_new_tokens) {
+                        Ok(out) => out,
                         Err(e) => {
-                            on_status(format!("LLM error: {e}"));
-                            reply(String::new());
+                            events.status(format!("LLM error: {e}"));
+                            String::new()
                         }
-                    }
-                    on_status("LLM ready.".to_string());
+                    };
+                    let _ = reply.send(out);
+                    events.status("LLM ready.");
                 }
-                Some(LlmMessage::Transcript(t)) => {
+                Some(LlmRequest::Transcript(t)) => {
                     let enough_new =
                         t.trim().len() >= min_chars && t.len().saturating_sub(answered_len) >= min_new_chars;
                     latest = Some(t);
@@ -448,8 +448,7 @@ pub fn spawn_worker(
                             &mut summary,
                             &mut summarized_prefix_tokens,
                             &mut answered_len,
-                            &on_response,
-                            &on_status,
+                            &events,
                         );
                     }
                 }
@@ -461,8 +460,7 @@ pub fn spawn_worker(
                         &mut summary,
                         &mut summarized_prefix_tokens,
                         &mut answered_len,
-                        &on_response,
-                        &on_status,
+                        &events,
                     );
                 }
             }
@@ -472,27 +470,25 @@ pub fn spawn_worker(
 
 /// Answer the pending transcript, update rolling memory, and clear `latest` so
 /// the worker blocks for the next snapshot.
-#[allow(clippy::too_many_arguments)]
 fn answer_now(
     engine: &mut LlmEngine,
     latest: &mut Option<String>,
     summary: &mut String,
     summarized_prefix_tokens: &mut usize,
     answered_len: &mut usize,
-    on_response: &Callback,
-    on_status: &Callback,
+    events: &EventSender,
 ) {
     let Some(text) = latest.clone() else {
         return;
     };
 
-    on_status("Assistant thinking...".to_string());
+    events.status("Assistant thinking...");
     match answer_with_memory(engine, &text, summary, summarized_prefix_tokens) {
         Ok(response) => {
             *answered_len = text.len();
-            on_response(response);
+            events.response(response);
         }
-        Err(e) => on_status(format!("LLM error: {e}")),
+        Err(e) => events.status(format!("LLM error: {e}")),
     }
     // Consumed; wait for the next transcript before answering again.
     *latest = None;

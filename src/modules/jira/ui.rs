@@ -7,6 +7,7 @@
 use dioxus::prelude::*;
 
 use super::Backend;
+use crate::core::CoreEvent;
 
 static MAIN_CSS: Asset = asset!("assets/vtmn-play/css/index.css");
 
@@ -38,6 +39,16 @@ pub enum Update {
     Proposals(Vec<ProposalView>),
 }
 
+impl From<CoreEvent> for Update {
+    fn from(event: CoreEvent) -> Self {
+        match event {
+            CoreEvent::Status(s) => Update::Status(s),
+            CoreEvent::Transcript(s) => Update::Transcript(s),
+            CoreEvent::Response(s) => Update::Response(s),
+        }
+    }
+}
+
 /// Root component: reproduces the Slint layout and wires signals to [`Backend`].
 #[component]
 pub fn AppJira() -> Element {
@@ -53,6 +64,7 @@ pub fn AppJira() -> Element {
     let project_key = use_signal(|| backend.jira_cfg.default_project.clone().unwrap_or_default());
     let mut input_text = use_signal(String::new);
     let proposals = use_signal(Vec::<ProposalView>::new);
+    let mut last_analyzed_len = use_signal(|| 0usize);
 
     // Expose the project key to proposal cards (used when applying).
     use_context_provider(|| ProjectKeySignal(project_key));
@@ -82,11 +94,7 @@ pub fn AppJira() -> Element {
                     match update {
                         Update::Status(s) => status_msg.set(s),
                         Update::Transcript(s) => transcript.set(s),
-                        Update::Response(s) => {
-                            let key = backend_cl.jira_cfg.default_project.clone().unwrap_or_default();
-                            backend_cl.analyze(s.clone(), key);
-                            llm_response.set(s);
-                        },
+                        Update::Response(s) => llm_response.set(s),
                         Update::DetectedIssues(s) => detected_issues.set(s),
                         Update::Analyzing(b) => analyzing.set(b),
                         Update::Proposals(p) => proposals.set(p),
@@ -108,6 +116,7 @@ pub fn AppJira() -> Element {
             if !is_recording() {
                 transcript.set(String::new());
                 llm_response.set(String::new());
+                last_analyzed_len.set(0);
                 match backend.start_recording() {
                     Ok(rec) => {
                         *recorder.borrow_mut() = Some(rec);
@@ -125,7 +134,7 @@ pub fn AppJira() -> Element {
                 }
                 is_recording.set(false);
                 status_msg
-                    .set("Stopped. Click 'Analyze' to extract Jira changes.".to_string());
+                    .set("Stopped. Proposals are extracted automatically as you speak.".to_string());
             }
         }
     };
@@ -146,10 +155,34 @@ pub fn AppJira() -> Element {
 
     let on_analyze = {
         let backend = backend.clone();
-        let llm_response = llm_response;
-        let project_key = project_key;
-        move |_| backend.analyze(llm_response(), project_key())
+        move |transcript_text: String, project: String| backend.analyze(transcript_text, project)
     };
+
+    // Auto-analyze: once the transcript (spoken or typed) grows by the configured
+    // number of characters since the last analysis, extract Jira proposals
+    // automatically — no button press required. The `analyzing` flag prevents
+    // overlapping runs; text that arrives mid-analysis is picked up on the next
+    // transcript change once analysis completes.
+    use_effect({
+        let backend = backend.clone();
+        let on_analyze = on_analyze.clone();
+        let transcript = transcript;
+        let analyzing = analyzing;
+        let project_key = project_key;
+        let mut last_analyzed_len = last_analyzed_len;
+        move || {
+            let current = transcript();
+            let len = current.len();
+            let threshold = backend.analyze_threshold();
+            if !analyzing()
+                && current.trim().len() >= 20
+                && len.saturating_sub(last_analyzed_len()) >= threshold
+            {
+                last_analyzed_len.set(len);
+                on_analyze(current, project_key());
+            }
+        }
+    });
 
     let recording = is_recording();
     let analyzing_now = analyzing();
@@ -178,11 +211,11 @@ pub fn AppJira() -> Element {
                     onclick: on_toggle,
                     if recording { "⏹️ Stop" } else { "🔴 Start Recording" }
                 }
-                button {
-                    class: "vp-button vp-button--small vp-button--secondary",
-                    disabled: analyzing_now,
-                    onclick: on_analyze,
-                    "🔎 Analyze for Jira changes"
+                if analyzing_now {
+                    span {
+                        style: "align-self: center; color: #5bc0de;",
+                        "🔎 Analyzing…"
+                    }
                 }
             }
 
@@ -274,7 +307,7 @@ pub fn AppJira() -> Element {
             if proposals_list.is_empty() {
                 div {
                     style: "color: #888;",
-                    "No proposals yet. Click 'Analyze for Jira changes'."
+                    "No proposals yet. They appear automatically as the discussion grows."
                 }
             }
 

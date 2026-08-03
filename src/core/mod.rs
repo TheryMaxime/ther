@@ -1,17 +1,18 @@
 //! UI-agnostic core services shared by all modules: model configuration, the
 //! speech-to-text recorder, and the embedded LLM engine/worker.
 //!
-//! Nothing in `core` depends on a concrete Slint window. Instead, modules pass
-//! in [`Callback`]s that receive transcript / response / status updates and are
-//! free to drive whatever UI they ship.
+//! Nothing in `core` depends on a concrete UI. Instead, modules pass in an
+//! [`EventSender`] that core services use to report transcript / response /
+//! status [`CoreEvent`]s, and drive whatever UI they ship from the matching
+//! receiver.
 
+pub mod bus;
 pub mod config;
 pub mod llm;
 pub mod mcp;
 pub mod stt;
 
-/// A thread-safe sink for a string update (transcript, response, or status).
-pub type Callback = Box<dyn Fn(String) + Send + 'static>;
+pub use bus::{CoreEvent, EventSender};
 
 /// Domain context a module injects into the LLM so its answers fit the module's
 /// purpose (e.g. Jira task extraction).

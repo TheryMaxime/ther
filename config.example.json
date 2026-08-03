@@ -20,5 +20,8 @@
   "temperature": 0.3,
   "top_p": 0.9,
   "repeat_penalty": 1.15,
-  "repeat_last_n": 64
+  "repeat_last_n": 64,
+
+  "//auto_analyze": "Automatically extract Jira proposals once the transcript grows by this many characters since the last analysis.",
+  "analyze_min_new_chars": 200
 }

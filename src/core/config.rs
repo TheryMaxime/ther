@@ -45,6 +45,10 @@ pub struct ModelConfig {
     pub debounce_ms: u64,
     pub min_chars: usize,
     pub min_new_chars: usize,
+
+    /// Auto-analyze gating: run Jira proposal extraction automatically once the
+    /// transcript grows by this many characters since the last analysis.
+    pub analyze_min_new_chars: usize,
 }
 
 /// Optional `config.json` overlay. Every field is optional.
@@ -76,6 +80,7 @@ struct FileConfig {
     debounce_ms: Option<u64>,
     min_chars: Option<usize>,
     min_new_chars: Option<usize>,
+    analyze_min_new_chars: Option<usize>,
 
     // --- Atlassian / Jira MCP ---
     atlassian_base_url: Option<String>,
@@ -302,6 +307,9 @@ impl ModelConfig {
         let min_new_chars = env_usize("LLM_MIN_NEW_CHARS")
             .or(file.min_new_chars)
             .unwrap_or(160);
+        let analyze_min_new_chars = env_usize("LLM_ANALYZE_MIN_NEW_CHARS")
+            .or(file.analyze_min_new_chars)
+            .unwrap_or(200);
 
         Self {
             whisper_model_path,
@@ -323,6 +331,7 @@ impl ModelConfig {
             debounce_ms,
             min_chars,
             min_new_chars,
+            analyze_min_new_chars,
         }
     }
 }

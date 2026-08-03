@@ -8,7 +8,8 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use crate::core::Callback;
+use crate::core::llm::LlmRequest;
+use crate::core::EventSender;
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// How often the worker re-transcribes the accumulated audio.
@@ -29,14 +30,13 @@ pub struct Recorder {
 impl Recorder {
     /// Start capturing the default input device and spawn the Whisper worker.
     ///
-    /// Transcript updates are delivered to `on_transcript`, status changes to
-    /// `on_status`, and (for the LLM worker) full transcripts on `transcript_tx`.
+    /// Transcript snapshots and status changes are emitted on `events`; each
+    /// changed transcript is also forwarded to the LLM worker on `llm_tx`.
     pub fn start(
         model: PathBuf,
         language: String,
-        on_transcript: Callback,
-        on_status: Callback,
-        transcript_tx: Sender<String>,
+        events: EventSender,
+        llm_tx: Sender<LlmRequest>,
     ) -> Result<Recorder, String> {
         if !Path::new(&model).exists() {
             return Err(format!(
@@ -76,9 +76,8 @@ impl Recorder {
                     raw,
                     input_rate,
                     stop_flag,
-                    on_transcript,
-                    on_status,
-                    transcript_tx,
+                    events,
+                    llm_tx,
                 );
             })
         };
@@ -167,9 +166,8 @@ fn run_worker(
     raw: Arc<Mutex<Vec<f32>>>,
     input_rate: u32,
     stop_flag: Arc<AtomicBool>,
-    on_transcript: Callback,
-    on_status: Callback,
-    transcript_tx: Sender<String>,
+    events: EventSender,
+    llm_tx: Sender<LlmRequest>,
 ) {
     let ctx = match WhisperContext::new_with_params(
         &model.to_string_lossy(),
@@ -177,14 +175,14 @@ fn run_worker(
     ) {
         Ok(c) => c,
         Err(e) => {
-            on_status(format!("Failed to load Whisper model: {e}"));
+            events.status(format!("Failed to load Whisper model: {e}"));
             return;
         }
     };
     let mut state = match ctx.create_state() {
         Ok(s) => s,
         Err(e) => {
-            on_status(format!("Failed to init Whisper state: {e}"));
+            events.status(format!("Failed to init Whisper state: {e}"));
             return;
         }
     };
@@ -207,11 +205,11 @@ fn run_worker(
 
         if audio.len() >= MIN_SAMPLES {
             if let Some(text) = transcribe(&mut state, &audio, &language) {
-                on_transcript(text.clone());
+                events.transcript(text.clone());
                 // Feed the LLM worker only when the transcript actually changed.
                 if !text.trim().is_empty() && text != last_sent {
                     last_sent = text.clone();
-                    let _ = transcript_tx.send(text);
+                    let _ = llm_tx.send(LlmRequest::Transcript(text));
                 }
             }
         }
