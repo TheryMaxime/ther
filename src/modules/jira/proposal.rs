@@ -6,12 +6,15 @@
 //! strict JSON, parsed defensively here, then surfaced in the UI for the user to
 //! edit and approve. Nothing is written to Jira without explicit approval.
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 /// Whether a proposal creates a new issue or updates an existing one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ProposalAction {
     Create,
     Update,
@@ -34,7 +37,7 @@ impl ProposalAction {
 }
 
 /// A single reviewable Jira change.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
     pub action: ProposalAction,
     /// Target issue key for updates (e.g. `PROJ-42`); empty for creates.
@@ -63,6 +66,40 @@ pub fn detect_issue_keys(transcript: &str) -> Vec<String> {
         }
     }
     seen
+}
+
+/// Normalize a summary for exact-match comparison: trim, lowercase, collapse
+/// runs of whitespace to a single space.
+pub fn normalized_summary(s: &str) -> String {
+    s.trim().to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Lowercased, deduplicated word set of `summary + description`, used for the
+/// token-overlap similarity fallback below.
+fn token_set(p: &Proposal) -> HashSet<String> {
+    format!("{} {}", p.summary, p.description)
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Jaccard-style token-overlap similarity between two proposals' text
+/// (`summary` + `description`), in `[0.0, 1.0]`. Used as a fallback match
+/// signal when neither `target_key` nor the normalized summary match exactly.
+pub fn similarity_score(a: &Proposal, b: &Proposal) -> f32 {
+    let sa = token_set(a);
+    let sb = token_set(b);
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    let intersection = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }
 
 /// Build the strict-JSON extraction prompt for the LLM.
@@ -273,6 +310,61 @@ mod tests {
     fn empty_on_garbage() {
         assert!(parse_proposals("no json here").is_empty());
         assert!(parse_proposals("{\"proposals\":[]}").is_empty());
+    }
+
+    #[test]
+    fn normalized_summary_collapses_case_and_whitespace() {
+        assert_eq!(
+            normalized_summary("  Add   Password   RESET \n"),
+            "add password reset"
+        );
+    }
+
+    fn proposal_with(summary: &str, description: &str) -> Proposal {
+        Proposal {
+            action: ProposalAction::Create,
+            target_key: String::new(),
+            issue_type: "Story".to_string(),
+            summary: summary.to_string(),
+            description: description.to_string(),
+            acceptance_criteria: String::new(),
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn similarity_score_is_one_for_identical_text() {
+        let a = proposal_with("Add password reset", "Users reset via email link");
+        let b = proposal_with("Add password reset", "Users reset via email link");
+        assert_eq!(similarity_score(&a, &b), 1.0);
+    }
+
+    #[test]
+    fn similarity_score_is_high_for_similar_text() {
+        let a = proposal_with("Add password reset via email", "Link expires after one hour");
+        let b = proposal_with("Add password reset by email", "Link expires in one hour");
+        let score = similarity_score(&a, &b);
+        assert!(score > 0.6, "expected high similarity, got {score}");
+    }
+
+    #[test]
+    fn similarity_score_is_low_for_unrelated_text() {
+        let a = proposal_with("Add password reset via email", "Link expires after one hour");
+        let b = proposal_with("Refactor CI pipeline caching", "Speed up docker layer builds");
+        let score = similarity_score(&a, &b);
+        assert!(score < 0.3, "expected low similarity, got {score}");
+    }
+
+    #[test]
+    fn proposal_action_serde_roundtrip_matches_str_forms() {
+        let create = serde_json::to_string(&ProposalAction::Create).unwrap();
+        let update = serde_json::to_string(&ProposalAction::Update).unwrap();
+        assert_eq!(create, "\"create\"");
+        assert_eq!(update, "\"update\"");
+        assert_eq!(
+            serde_json::from_str::<ProposalAction>("\"update\"").unwrap(),
+            ProposalAction::Update
+        );
     }
 
     #[test]

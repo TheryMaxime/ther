@@ -8,11 +8,13 @@
 
 pub mod bus;
 pub mod config;
+pub mod context_store;
 pub mod llm;
 pub mod mcp;
 pub mod stt;
 
 pub use bus::{CoreEvent, EventSender};
+pub use context_store::ContextStore;
 
 /// Domain context a module injects into the LLM so its answers fit the module's
 /// purpose (e.g. Jira task extraction).

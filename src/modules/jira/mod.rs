@@ -17,9 +17,10 @@ use super::Module;
 use crate::core::config::{JiraConfig, ModelConfig};
 use crate::core::llm::{self, LlmRequest};
 use crate::core::stt::Recorder;
-use crate::core::{EventSender, LlmContext};
+use crate::core::{ContextStore, EventSender, LlmContext};
 
 use dioxus::desktop::{Config, WindowBuilder};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 mod jira_client;
@@ -29,8 +30,17 @@ mod ui;
 use jira_client::{created_key, JiraClient};
 use ui::{AppJira, ProposalView, Update};
 use proposal::{
-    build_extraction_prompt, detect_issue_keys, parse_proposals, Proposal, ProposalAction,
+    build_extraction_prompt, detect_issue_keys, normalized_summary, parse_proposals,
+    similarity_score, Proposal, ProposalAction,
 };
+
+/// [`ContextStore`] namespace this module stores its data under.
+const MODULE_ID: &str = "jira";
+/// Collection name for reviewable proposals within the store.
+const PROPOSALS_COLLECTION: &str = "proposals";
+/// Minimum token-overlap similarity to treat two proposals as "the same"
+/// when neither `target_key` nor the normalized summary match exactly.
+const SIMILARITY_MATCH_THRESHOLD: f32 = 0.6;
 
 /// Assistant instruction for the Jira use-case (live running notes).
 const JIRA_SYSTEM_PROMPT: &str =
@@ -47,7 +57,11 @@ const JIRA_CONTEXT: &str =
 const PROPOSAL_MAX_TOKENS: usize = 640;
 
 /// A proposal plus its review state, held in Rust as the source of truth.
-#[derive(Clone)]
+///
+/// Also mirrored into the module's [`ContextStore`] namespace (see
+/// [`Backend::sync_context`]) so it can be fetched generically, the same way
+/// any other module's cached context can.
+#[derive(Clone, Serialize, Deserialize)]
 struct ProposalItem {
     id: i32,
     proposal: Proposal,
@@ -130,6 +144,10 @@ pub struct Backend {
     jira_client: Arc<tokio::sync::Mutex<Option<JiraClient>>>,
     items: Arc<Mutex<Vec<ProposalItem>>>,
     next_id: Arc<AtomicI32>,
+    /// Generic in-memory cache mirroring `items`, exposed via the same
+    /// [`ContextStore`] API any module can use to fetch/update previously
+    /// generated context (see [`Backend::sync_context`]).
+    context: ContextStore,
     /// Typed request channel into the embedded LLM worker.
     llm_tx: mpsc::Sender<LlmRequest>,
     /// Shared event sink handed to core services (STT, LLM) for status /
@@ -161,6 +179,16 @@ impl Backend {
         let snapshot: Vec<ProposalView> =
             self.items.lock().unwrap().iter().map(to_proposal_view).collect();
         self.emit(Update::Proposals(snapshot));
+    }
+
+    /// Mirror the current `items` into the generic [`ContextStore`] so they
+    /// can be fetched later the same way any module's cached context can
+    /// (`context.list::<ProposalItem>("jira", "proposals")`).
+    fn sync_context(&self) {
+        let guard = self.items.lock().unwrap();
+        for item in guard.iter() {
+            let _ = self.context.put(MODULE_ID, PROPOSALS_COLLECTION, item.id.to_string(), item);
+        }
     }
 
     /// Start microphone capture + live transcription. The returned [`Recorder`]
@@ -212,8 +240,29 @@ impl Backend {
         let this = self.clone();
         self.tokio_rt.spawn(async move {
             // Best-effort: fetch context for explicitly-mentioned issues.
-            let issue_context =
+            let mut issue_context =
                 build_issue_context(&this.jira_client, &this.jira_cfg, &keys, &transcript).await;
+
+            // Fetch previously generated proposals from the generic context
+            // store and make the LLM aware of them, so it can prefer
+            // referencing/updating one instead of proposing a duplicate.
+            let cached: Vec<ProposalItem> = this
+                .context
+                .list::<ProposalItem>(MODULE_ID, PROPOSALS_COLLECTION)
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect();
+            let cached_block = render_cached_for_prompt(&cached);
+            if !cached_block.is_empty() {
+                if !issue_context.trim().is_empty() {
+                    issue_context.push_str("\n\n");
+                }
+                issue_context.push_str(
+                    "Proposals already tracked this session (avoid duplicating; prefer \
+                     referencing them if this is the same change):\n",
+                );
+                issue_context.push_str(&cached_block);
+            }
 
             let default_project = this
                 .jira_cfg
@@ -246,23 +295,34 @@ impl Backend {
                 }
             };
 
-            // Parse -> populate the review list.
+            // Merge each parsed proposal into existing tracked proposals when
+            // it looks like the same change (matched via `find_match`),
+            // updating it in place instead of appending a duplicate.
+            // Otherwise, add it as a new item.
             let parsed = parse_proposals(&raw);
-            let mut new_items: Vec<ProposalItem> = parsed
-                .into_iter()
-                .map(|p| ProposalItem {
-                    id: this.next_id.fetch_add(1, Ordering::SeqCst),
-                    proposal: p,
-                    status: "pending".to_string(),
-                    result: String::new(),
-                })
-                .collect();
-
-            let count = new_items.len();
+            let mut new_count = 0usize;
+            let mut updated_count = 0usize;
             {
                 let mut guard = this.items.lock().unwrap();
-                guard.append(&mut new_items);
+                for p in parsed {
+                    if let Some(idx) = find_match(&p, &guard) {
+                        let item = &mut guard[idx];
+                        item.proposal = p;
+                        item.status = "pending".to_string();
+                        item.result = String::new();
+                        updated_count += 1;
+                    } else {
+                        guard.push(ProposalItem {
+                            id: this.next_id.fetch_add(1, Ordering::SeqCst),
+                            proposal: p,
+                            status: "pending".to_string(),
+                            result: String::new(),
+                        });
+                        new_count += 1;
+                    }
+                }
             }
+            this.sync_context();
             this.render_proposals();
 
             // For any UPDATE whose target key is unknown, search the project for
@@ -283,7 +343,7 @@ impl Backend {
                 String::new()
             };
             this.emit(Update::Status(format!(
-                "{count} proposal(s) ready for review.{extra}"
+                "{new_count} new, {updated_count} updated proposal(s) ready for review.{extra}"
             )));
         });
     }
@@ -291,17 +351,20 @@ impl Backend {
     /// Apply an inline edit to a proposal field (no re-render: the DOM already
     /// holds the user's text, and re-pushing would clobber concurrent edits).
     pub fn update_proposal(&self, id: i32, field: &str, value: String) {
-        let mut guard = self.items.lock().unwrap();
-        if let Some(item) = guard.iter_mut().find(|i| i.id == id) {
-            match field {
-                "summary" => item.proposal.summary = value,
-                "description" => item.proposal.description = value,
-                "acceptance_criteria" => item.proposal.acceptance_criteria = value,
-                "issue_type" => item.proposal.issue_type = value,
-                "target_key" => item.proposal.target_key = value,
-                _ => {}
+        {
+            let mut guard = self.items.lock().unwrap();
+            if let Some(item) = guard.iter_mut().find(|i| i.id == id) {
+                match field {
+                    "summary" => item.proposal.summary = value,
+                    "description" => item.proposal.description = value,
+                    "acceptance_criteria" => item.proposal.acceptance_criteria = value,
+                    "issue_type" => item.proposal.issue_type = value,
+                    "target_key" => item.proposal.target_key = value,
+                    _ => {}
+                }
             }
         }
+        self.sync_context();
     }
 
     /// Reject a proposal (never written to Jira).
@@ -312,6 +375,7 @@ impl Backend {
                 item.status = "rejected".to_string();
             }
         }
+        self.sync_context();
         self.render_proposals();
     }
 
@@ -329,6 +393,7 @@ impl Backend {
                 None => return,
             }
         };
+        self.sync_context();
         self.render_proposals();
 
         let this = self.clone();
@@ -350,9 +415,84 @@ impl Backend {
                     }
                 }
             }
+            this.sync_context();
             this.render_proposals();
         });
     }
+}
+
+// --- Proposal caching / merge helpers --------------------------------------
+
+/// Find the index of an existing (non-terminal) [`ProposalItem`] in `items`
+/// that represents the same change as `candidate`, so `analyze()` can update
+/// it in place instead of appending a duplicate.
+///
+/// Matching, in priority order:
+/// 1. Both have a non-empty `target_key` and they're equal (case-insensitive).
+/// 2. Their normalized summaries are exactly equal.
+/// 3. Token-overlap similarity of `summary + description` is the highest
+///    among candidates and exceeds [`SIMILARITY_MATCH_THRESHOLD`].
+///
+/// Items already `"applied"` or `"rejected"` are left alone (finalized), so a
+/// re-analysis never silently rewrites them; a fresh proposal is created for
+/// those instead.
+fn find_match(candidate: &Proposal, items: &[ProposalItem]) -> Option<usize> {
+    let eligible = || {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.status != "applied" && item.status != "rejected")
+    };
+
+    if !candidate.target_key.trim().is_empty() {
+        if let Some((idx, _)) = eligible().find(|(_, item)| {
+            !item.proposal.target_key.trim().is_empty()
+                && item.proposal.target_key.trim().eq_ignore_ascii_case(candidate.target_key.trim())
+        }) {
+            return Some(idx);
+        }
+    }
+
+    let candidate_summary = normalized_summary(&candidate.summary);
+    if !candidate_summary.is_empty() {
+        if let Some((idx, _)) =
+            eligible().find(|(_, item)| normalized_summary(&item.proposal.summary) == candidate_summary)
+        {
+            return Some(idx);
+        }
+    }
+
+    eligible()
+        .map(|(idx, item)| (idx, similarity_score(candidate, &item.proposal)))
+        .filter(|(_, score)| *score > SIMILARITY_MATCH_THRESHOLD)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(idx, _)| idx)
+}
+
+/// Render currently-tracked (non-rejected) proposals as a compact bullet list
+/// for the LLM extraction prompt, so the model is aware of what's already on
+/// the table and can prefer referencing/updating it over proposing a
+/// near-duplicate.
+fn render_cached_for_prompt(items: &[ProposalItem]) -> String {
+    items
+        .iter()
+        .filter(|item| item.status != "rejected")
+        .map(|item| {
+            let target = if item.proposal.target_key.trim().is_empty() {
+                "(new)".to_string()
+            } else {
+                item.proposal.target_key.clone()
+            };
+            format!(
+                "- [{}] {} {} :: {}",
+                item.proposal.action.as_str(),
+                item.proposal.issue_type,
+                target,
+                item.proposal.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // --- UI <-> state rendering ------------------------------------------------
@@ -430,6 +570,7 @@ fn run_app(llm_ctx: LlmContext) -> Result<(), Box<dyn std::error::Error>> {
         jira_client,
         items,
         next_id,
+        context: ContextStore::new(),
         llm_tx,
         events: events.clone(),
         update_tx,
@@ -704,5 +845,104 @@ async fn apply_proposal(
             }
             Ok(format!("✅ Updated {key}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: i32, action: ProposalAction, target_key: &str, summary: &str, status: &str) -> ProposalItem {
+        ProposalItem {
+            id,
+            proposal: Proposal {
+                action,
+                target_key: target_key.to_string(),
+                issue_type: "Story".to_string(),
+                summary: summary.to_string(),
+                description: "Users can reset their password via an emailed link.".to_string(),
+                acceptance_criteria: String::new(),
+                rationale: String::new(),
+            },
+            status: status.to_string(),
+            result: String::new(),
+        }
+    }
+
+    fn candidate(action: ProposalAction, target_key: &str, summary: &str, description: &str) -> Proposal {
+        Proposal {
+            action,
+            target_key: target_key.to_string(),
+            issue_type: "Story".to_string(),
+            summary: summary.to_string(),
+            description: description.to_string(),
+            acceptance_criteria: String::new(),
+            rationale: String::new(),
+        }
+    }
+
+    #[test]
+    fn find_match_by_exact_target_key() {
+        let items = vec![item(1, ProposalAction::Update, "PROJ-42", "Trim onboarding epic", "pending")];
+        let c = candidate(ProposalAction::Update, "PROJ-42", "Different wording entirely", "unrelated text");
+        assert_eq!(find_match(&c, &items), Some(0));
+    }
+
+    #[test]
+    fn find_match_by_exact_normalized_summary() {
+        let items = vec![item(1, ProposalAction::Create, "", "Add password reset", "pending")];
+        let c = candidate(ProposalAction::Create, "", "  ADD   password reset  ", "some other description");
+        assert_eq!(find_match(&c, &items), Some(0));
+    }
+
+    #[test]
+    fn find_match_by_similarity_fallback() {
+        let items = vec![item(
+            1,
+            ProposalAction::Create,
+            "",
+            "Add password reset via email",
+            "pending",
+        )];
+        let c = candidate(
+            ProposalAction::Create,
+            "",
+            "Add password reset by email",
+            "Users can reset their password via an emailed link.",
+        );
+        assert_eq!(find_match(&c, &items), Some(0));
+    }
+
+    #[test]
+    fn find_match_returns_none_for_unrelated_proposal() {
+        let items = vec![item(1, ProposalAction::Create, "", "Add password reset", "pending")];
+        let c = candidate(
+            ProposalAction::Create,
+            "",
+            "Refactor CI pipeline caching",
+            "Speed up docker layer builds by caching more aggressively.",
+        );
+        assert_eq!(find_match(&c, &items), None);
+    }
+
+    #[test]
+    fn find_match_ignores_finalized_items() {
+        let items = vec![
+            item(1, ProposalAction::Create, "", "Add password reset", "applied"),
+            item(2, ProposalAction::Create, "", "Add password reset", "rejected"),
+        ];
+        let c = candidate(ProposalAction::Create, "", "Add password reset", "same idea again");
+        assert_eq!(find_match(&c, &items), None);
+    }
+
+    #[test]
+    fn render_cached_for_prompt_skips_rejected_and_formats_pending() {
+        let items = vec![
+            item(1, ProposalAction::Create, "", "Add password reset", "pending"),
+            item(2, ProposalAction::Update, "PROJ-42", "Trim onboarding epic", "rejected"),
+        ];
+        let rendered = render_cached_for_prompt(&items);
+        assert!(rendered.contains("Add password reset"));
+        assert!(!rendered.contains("Trim onboarding epic"));
     }
 }
