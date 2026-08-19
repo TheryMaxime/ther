@@ -49,22 +49,76 @@ pub struct Proposal {
     pub acceptance_criteria: String,
     /// Why the assistant proposed this (shown to the reviewer, not sent to Jira).
     pub rationale: String,
+    /// Jira priority name (e.g. "High"); empty when not specified.
+    #[serde(default)]
+    pub priority: String,
+    /// Jira labels; empty when not specified.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Assignee display name or account id; empty when not specified.
+    #[serde(default)]
+    pub assignee: String,
+    /// Sprint name; empty when not specified.
+    #[serde(default)]
+    pub sprint: String,
 }
 
 /// Matches explicit Jira issue keys such as `PROJ-42` or `AB12-7`.
 static ISSUE_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").unwrap());
 
-/// Detect explicit Jira issue keys mentioned in the transcript, de-duplicated
-/// while preserving first-seen order.
-pub fn detect_issue_keys(transcript: &str) -> Vec<String> {
+/// Generic terms people use in speech/notes to refer to an issue by number
+/// without its project prefix (e.g. "US 84", "story 84", "issue-84",
+/// "user story 84"). Matched case-insensitively and combined with the
+/// configured default project to build the real key (e.g. `CBMS-84`).
+static IMPLICIT_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:user\s+story|us|story|issue|ticket|task|bug|epic)\s*#?\s*-?\s*(\d+)\b")
+        .unwrap()
+});
+
+/// Bare prefixes (case-insensitive) that, even when they happen to match the
+/// *explicit* key pattern (e.g. spoken/typed as `US-84`), mean "issue number
+/// N in the default project" rather than a literal project code - "US" isn't
+/// a real Jira project here, it's shorthand for "user story".
+const GENERIC_PREFIXES: &[&str] = &["us", "story", "issue", "ticket", "task", "bug", "epic"];
+
+/// Detect Jira issue keys mentioned in `transcript`, de-duplicated while
+/// preserving first-seen order. Recognizes both explicit keys (`PROJ-42`) and
+/// implicit references by number alone (`US 84`, `story 84`, `issue-84`, ...),
+/// which are resolved against `default_project` (e.g. `US 84` + `CBMS` ->
+/// `CBMS-84`). Implicit references are skipped when no default project is
+/// configured, since there's nothing to resolve them against.
+pub fn detect_issue_keys(transcript: &str, default_project: Option<&str>) -> Vec<String> {
     let mut seen = Vec::new();
-    for m in ISSUE_KEY_RE.find_iter(transcript) {
-        let key = m.as_str().to_string();
+    let mut push = |key: String| {
         if !seen.contains(&key) {
             seen.push(key);
         }
+    };
+
+    for m in ISSUE_KEY_RE.find_iter(transcript) {
+        let raw = m.as_str();
+        // A generic prefix (e.g. `US-84`) means "issue 84 in the default
+        // project", not a literal project code - resolve it the same way as
+        // the space-separated implicit form below.
+        if let Some((prefix, number)) = raw.rsplit_once('-') {
+            if GENERIC_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(prefix)) {
+                if let Some(project) = default_project.filter(|p| !p.trim().is_empty()) {
+                    push(format!("{}-{number}", project.trim()));
+                    continue;
+                }
+            }
+        }
+        push(raw.to_string());
     }
+
+    if let Some(project) = default_project.filter(|p| !p.trim().is_empty()) {
+        for m in IMPLICIT_KEY_RE.captures_iter(transcript) {
+            let number = &m[1];
+            push(format!("{}-{number}", project.trim()));
+        }
+    }
+
     seen
 }
 
@@ -130,12 +184,20 @@ Rules:\n\
 - \"action\" is exactly \"create\" or \"update\" (never \"delete\").\n\
 - Use \"update\" only when an existing KEY-123 is clearly the subject; else \"create\".\n\
 - \"target_key\" is set only for updates, else \"\".\n\
+- Output ONE proposal per distinct action item discussed. NEVER merge unrelated \
+changes into a single proposal - e.g. an edit to an existing issue and the \
+creation of a brand-new, different story are always two separate proposals, \
+even if they were discussed back-to-back or in the same breath.\n\
+- \"priority\", \"assignee\", and \"sprint\" are optional strings; \"labels\" is an \
+optional array of strings. Leave them empty/omitted unless the meeting explicitly \
+states them.\n\
 - If nothing is actionable, output {{\"proposals\":[]}}.\n\n\
 Example output:\n\
 {{\"proposals\":[{{\"action\":\"create\",\"target_key\":\"\",\"issue_type\":\"Story\",\
 \"summary\":\"Add password reset via email\",\"description\":\"Users request a reset \
 link by email that expires after one hour.\",\"acceptance_criteria\":\"Link expires in 1h; \
-one active link per user.\",\"rationale\":\"Team agreed users need self-service reset.\"}}]}}\n\n\
+one active link per user.\",\"rationale\":\"Team agreed users need self-service reset.\",\
+\"priority\":\"High\",\"labels\":[\"auth\"],\"assignee\":\"\",\"sprint\":\"\"}}]}}\n\n\
 Assistant's running notes so far:\n{notes}\n\n\
 Now output the JSON object for these notes: [/INST]\n{PROPOSAL_PRIME}"
     )
@@ -214,7 +276,31 @@ fn proposal_from_value(value: &serde_json::Value) -> Option<Proposal> {
         description,
         acceptance_criteria: get("acceptance_criteria"),
         rationale: get("rationale"),
+        priority: get("priority"),
+        labels: get_labels(value),
+        assignee: get("assignee"),
+        sprint: get("sprint"),
     })
+}
+
+/// Parse the `labels` field of a proposal, tolerating either a JSON array of
+/// strings or a single comma-separated string (small models sometimes emit
+/// either shape).
+fn get_labels(value: &serde_json::Value) -> Vec<String> {
+    match value.get("labels") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Derive a short title from a description (first sentence, capped length).
@@ -230,6 +316,31 @@ fn derive_summary(description: &str) -> String {
         s.push('…');
     }
     s
+}
+
+/// Heuristic check for whether the raw LLM completion was cut off mid-JSON
+/// (e.g. hit `max_new_tokens` before finishing the last proposal object).
+///
+/// Counts brace/bracket opens vs. closes across the whole string: a
+/// well-formed completion always leaves every object/array it opened closed
+/// (whether that's a full `{"proposals": [...]}` wrapper, or - when the prompt
+/// was primed with the wrapper's opening - a sequence of self-contained
+/// proposal objects). A surplus of opens means the last object was left
+/// dangling, which is exactly what happens when generation is truncated
+/// mid-proposal - and is otherwise silently dropped by [`parse_proposals`].
+pub fn output_looks_truncated(raw: &str) -> bool {
+    let mut brace = 0i32;
+    let mut bracket = 0i32;
+    for b in raw.bytes() {
+        match b {
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b'[' => bracket += 1,
+            b']' => bracket -= 1,
+            _ => {}
+        }
+    }
+    brace > 0 || bracket > 0
 }
 
 /// Yield every top-level balanced `{..}` / `[..]` span in `raw`, in order.
@@ -278,7 +389,50 @@ mod tests {
     #[test]
     fn detects_and_dedups_issue_keys() {
         let t = "We should update PROJ-42 and also PROJ-42, plus AB12-7. Not a-1 or lowercase.";
-        assert_eq!(detect_issue_keys(t), vec!["PROJ-42", "AB12-7"]);
+        assert_eq!(detect_issue_keys(t, None), vec!["PROJ-42", "AB12-7"]);
+    }
+
+    #[test]
+    fn detects_implicit_key_with_default_project() {
+        let t = "Let's look at US 84 and add the acceptance criteria.";
+        assert_eq!(detect_issue_keys(t, Some("CBMS")), vec!["CBMS-84"]);
+    }
+
+    #[test]
+    fn detects_various_implicit_synonyms() {
+        let t = "See story 12, issue 13, ticket-14, task 15, bug 16, epic 17, and user story 18.";
+        assert_eq!(
+            detect_issue_keys(t, Some("CBMS")),
+            vec![
+                "CBMS-12",
+                "CBMS-13",
+                "CBMS-14",
+                "CBMS-15",
+                "CBMS-16",
+                "CBMS-17",
+                "CBMS-18",
+            ]
+        );
+    }
+
+    #[test]
+    fn implicit_key_ignored_without_default_project() {
+        let t = "Let's look at US 84.";
+        assert!(detect_issue_keys(t, None).is_empty());
+    }
+
+    #[test]
+    fn generic_prefix_explicit_form_resolved_to_default_project() {
+        // Spoken/typed as `US-84`: "US" here means "user story", not a literal
+        // project code, so it should resolve against the default project.
+        let t = "Update US-84 with the new points.";
+        assert_eq!(detect_issue_keys(t, Some("CBMS")), vec!["CBMS-84"]);
+    }
+
+    #[test]
+    fn real_project_key_not_confused_when_not_generic() {
+        let t = "Update PROJ-42.";
+        assert_eq!(detect_issue_keys(t, Some("CBMS")), vec!["PROJ-42"]);
     }
 
     #[test]
@@ -332,6 +486,10 @@ mod tests {
             description: description.to_string(),
             acceptance_criteria: String::new(),
             rationale: String::new(),
+            priority: String::new(),
+            labels: Vec::new(),
+            assignee: String::new(),
+            sprint: String::new(),
         }
     }
 
@@ -381,5 +539,57 @@ mod tests {
         assert_eq!(props.len(), 2);
         assert_eq!(props[0].summary, "Add reset");
         assert_eq!(props[1].target_key, "PROJ-42");
+    }
+
+    #[test]
+    fn parses_new_fields_with_array_labels() {
+        let raw = "{\"action\":\"create\",\"summary\":\"Add reset\",\"description\":\"via email\",\
+\"priority\":\"High\",\"labels\":[\"auth\",\"backend\"],\"assignee\":\"alice\",\"sprint\":\"Sprint 4\"}";
+        let props = parse_proposals(raw);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].priority, "High");
+        assert_eq!(props[0].labels, vec!["auth".to_string(), "backend".to_string()]);
+        assert_eq!(props[0].assignee, "alice");
+        assert_eq!(props[0].sprint, "Sprint 4");
+    }
+
+    #[test]
+    fn parses_new_fields_with_comma_string_labels() {
+        let raw = "{\"action\":\"create\",\"summary\":\"Add reset\",\"labels\":\"auth, backend ,\"}";
+        let props = parse_proposals(raw);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].labels, vec!["auth".to_string(), "backend".to_string()]);
+    }
+
+    #[test]
+    fn output_truncated_flags_dangling_unclosed_object() {
+        // Model was cut off mid-way through the second proposal's description.
+        let raw = "{\"action\":\"create\",\"summary\":\"Add reset\"},\n\
+{\"action\":\"create\",\"summary\":\"Second one\",\"description\":\"cut off here";
+        assert!(output_looks_truncated(raw));
+    }
+
+    #[test]
+    fn output_not_truncated_for_well_formed_wrapper() {
+        let raw = "{\"proposals\":[{\"action\":\"create\",\"summary\":\"Add reset\"}]}";
+        assert!(!output_looks_truncated(raw));
+    }
+
+    #[test]
+    fn output_not_truncated_for_well_formed_primed_objects() {
+        let raw = "{\"action\":\"create\",\"summary\":\"Add reset\"},\
+{\"action\":\"update\",\"target_key\":\"PROJ-42\",\"summary\":\"Trim epic\"}";
+        assert!(!output_looks_truncated(raw));
+    }
+
+    #[test]
+    fn new_fields_default_to_empty_when_absent() {
+        let raw = "{\"action\":\"create\",\"summary\":\"Add reset\"}";
+        let props = parse_proposals(raw);
+        assert_eq!(props.len(), 1);
+        assert!(props[0].priority.is_empty());
+        assert!(props[0].labels.is_empty());
+        assert!(props[0].assignee.is_empty());
+        assert!(props[0].sprint.is_empty());
     }
 }

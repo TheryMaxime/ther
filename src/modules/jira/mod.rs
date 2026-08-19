@@ -37,8 +37,8 @@ mod ui;
 use jira_client::{created_key, JiraClient};
 use ui::{AppJira, ProposalView, Update};
 use proposal::{
-    build_extraction_prompt, detect_issue_keys, normalized_summary, parse_proposals,
-    similarity_score, Proposal, ProposalAction,
+    build_extraction_prompt, detect_issue_keys, normalized_summary, output_looks_truncated,
+    parse_proposals, similarity_score, Proposal, ProposalAction,
 };
 
 /// [`ContextStore`] namespace this module stores its data under.
@@ -61,7 +61,12 @@ const JIRA_CONTEXT: &str =
 `summary` (imperative title), a `description`, and `acceptance criteria`.";
 
 /// Max tokens for a structured proposal-extraction completion.
-const PROPOSAL_MAX_TOKENS: usize = 640;
+///
+/// Sized to comfortably fit several full proposals (each with summary,
+/// description, acceptance_criteria, rationale, etc.) in one completion so a
+/// meeting with multiple distinct asks (e.g. an update plus a new story) isn't
+/// truncated mid-JSON, which would silently drop the tail proposal(s).
+const PROPOSAL_MAX_TOKENS: usize = 1536;
 
 /// A proposal plus its review state, held in Rust as the source of truth.
 ///
@@ -75,6 +80,14 @@ struct ProposalItem {
     /// "pending" | "approved" | "rejected" | "applied" | "error".
     status: String,
     result: String,
+    /// Current field values for the target issue, fetched for `update`
+    /// proposals so the UI can render an old→new diff before applying.
+    #[serde(default)]
+    current: Option<jira_client::IssueSnapshot>,
+    /// Bulk-selection checkbox state (not persisted across restarts, but kept
+    /// on the item so `analyze()` doesn't need a separate selection map).
+    #[serde(default, skip_serializing)]
+    selected: bool,
 }
 
 /// The Jira module entry point.
@@ -261,7 +274,15 @@ impl Backend {
         self.emit(Update::Analyzing(true));
         self.emit(Update::Status("Resolving issues under discussion...".to_string()));
 
-        let keys = detect_issue_keys(&transcript);
+        // Resolve the default project up front: it grounds both explicit
+        // generic-prefix keys (`US-84`) and bare-number references (`US 84`,
+        // `story 84`, ...) to a real issue key (e.g. `CBMS-84`).
+        let default_project = self
+            .jira_cfg
+            .default_project
+            .clone()
+            .unwrap_or_else(|| project_key.clone());
+        let keys = detect_issue_keys(&transcript, Some(&default_project));
         let detected = if keys.is_empty() {
             "none detected".to_string()
         } else {
@@ -298,11 +319,6 @@ impl Backend {
                 issue_context.push_str(&cached_block);
             }
 
-            let default_project = this
-                .jira_cfg
-                .default_project
-                .clone()
-                .unwrap_or_else(|| project_key.clone());
             let prompt = build_extraction_prompt(&notes, &issue_context, &default_project);
 
             // Ask the LLM worker for a structured completion and await its reply.
@@ -329,6 +345,12 @@ impl Backend {
                 }
             };
 
+            // Flag (best-effort) when the completion was cut off mid-JSON, so a
+            // trailing proposal silently dropped by `parse_proposals` doesn't go
+            // unnoticed - the user can re-analyze once more transcript/notes
+            // accumulate, or the extraction budget can be raised.
+            let truncated = output_looks_truncated(&raw);
+
             // Merge each parsed proposal into existing tracked proposals when
             // it looks like the same change (matched via `find_match`),
             // updating it in place instead of appending a duplicate.
@@ -344,6 +366,7 @@ impl Backend {
                         item.proposal = p;
                         item.status = "pending".to_string();
                         item.result = String::new();
+                        item.current = None;
                         updated_count += 1;
                     } else {
                         guard.push(ProposalItem {
@@ -351,6 +374,8 @@ impl Backend {
                             proposal: p,
                             status: "pending".to_string(),
                             result: String::new(),
+                            current: None,
+                            selected: false,
                         });
                         new_count += 1;
                     }
@@ -370,14 +395,24 @@ impl Backend {
             .await;
             this.render_proposals();
 
+            // For UPDATE proposals with a known target, fetch the issue's
+            // current field values so the UI can render an old→new diff.
+            refresh_update_snapshots(&this.jira_client, &this.jira_cfg, &this.items).await;
+            this.render_proposals();
+
             this.emit(Update::Analyzing(false));
             let extra = if matched > 0 {
                 format!(" ({matched} update target(s) matched)")
             } else {
                 String::new()
             };
+            let warning = if truncated {
+                " Warning: LLM output looked truncated; some proposals may be missing - try analyzing again."
+            } else {
+                ""
+            };
             this.emit(Update::Status(format!(
-                "{new_count} new, {updated_count} updated proposal(s) ready for review.{extra}"
+                "{new_count} new, {updated_count} updated proposal(s) ready for review.{extra}{warning}"
             )));
         });
     }
@@ -394,11 +429,32 @@ impl Backend {
                     "acceptance_criteria" => item.proposal.acceptance_criteria = value,
                     "issue_type" => item.proposal.issue_type = value,
                     "target_key" => item.proposal.target_key = value,
+                    "priority" => item.proposal.priority = value,
+                    "assignee" => item.proposal.assignee = value,
+                    "sprint" => item.proposal.sprint = value,
+                    "labels" => {
+                        item.proposal.labels = value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
                     _ => {}
                 }
             }
         }
         self.sync_context();
+    }
+
+    /// Toggle a proposal's bulk-selection checkbox.
+    pub fn toggle_selected(&self, id: i32, selected: bool) {
+        {
+            let mut guard = self.items.lock().unwrap();
+            if let Some(item) = guard.iter_mut().find(|i| i.id == id) {
+                item.selected = selected;
+            }
+        }
+        self.render_proposals();
     }
 
     /// Reject a proposal (never written to Jira).
@@ -413,8 +469,44 @@ impl Backend {
         self.render_proposals();
     }
 
+    /// Reject every currently-selected, actionable proposal.
+    pub fn reject_selected(&self) {
+        let ids: Vec<i32> = {
+            let guard = self.items.lock().unwrap();
+            guard
+                .iter()
+                .filter(|i| i.selected && (i.status == "pending" || i.status == "approved"))
+                .map(|i| i.id)
+                .collect()
+        };
+        for id in ids {
+            self.reject_proposal(id);
+        }
+    }
+
     /// Approve a (possibly edited) proposal and apply it to Jira.
     pub fn approve_proposal(&self, id: i32, project_key: String) {
+        self.start_apply(id, project_key);
+    }
+
+    /// Approve and apply every currently-selected, pending proposal.
+    pub fn approve_selected(&self, project_key: String) {
+        let ids: Vec<i32> = {
+            let guard = self.items.lock().unwrap();
+            guard
+                .iter()
+                .filter(|i| i.selected && i.status == "pending")
+                .map(|i| i.id)
+                .collect()
+        };
+        for id in ids {
+            self.start_apply(id, project_key.clone());
+        }
+    }
+
+    /// Mark a proposal approved and spawn the async apply against Jira.
+    /// Shared by [`Backend::approve_proposal`] and [`Backend::approve_selected`].
+    fn start_apply(&self, id: i32, project_key: String) {
         // Snapshot the (possibly edited) proposal and mark it in-flight.
         let proposal = {
             let mut guard = self.items.lock().unwrap();
@@ -532,6 +624,7 @@ fn render_cached_for_prompt(items: &[ProposalItem]) -> String {
 // --- UI <-> state rendering ------------------------------------------------
 
 fn to_proposal_view(item: &ProposalItem) -> ProposalView {
+    let current = item.current.as_ref();
     ProposalView {
         id: item.id,
         action: item.proposal.action.as_str().to_string(),
@@ -541,8 +634,19 @@ fn to_proposal_view(item: &ProposalItem) -> ProposalView {
         description: item.proposal.description.clone(),
         acceptance_criteria: item.proposal.acceptance_criteria.clone(),
         rationale: item.proposal.rationale.clone(),
+        priority: item.proposal.priority.clone(),
+        labels: item.proposal.labels.join(", "),
+        assignee: item.proposal.assignee.clone(),
+        sprint: item.proposal.sprint.clone(),
+        selected: item.selected,
         status: item.status.clone(),
         result: item.result.clone(),
+        current_summary: current.map(|c| c.summary.clone()),
+        current_description: current.map(|c| c.description.clone()),
+        current_priority: current.map(|c| c.priority.clone()),
+        current_labels: current.map(|c| c.labels.join(", ")),
+        current_assignee: current.map(|c| c.assignee.clone()),
+        current_sprint: current.map(|c| c.sprint.clone()),
     }
 }
 
@@ -808,6 +912,47 @@ async fn resolve_update_targets(
     resolved
 }
 
+/// For each UPDATE proposal with a known `target_key` and no snapshot yet,
+/// fetch the issue's current field values so the UI can render an old→new
+/// diff before the change is applied. Best effort: failures are silently
+/// skipped (the UI falls back to plain edit inputs with no diff).
+async fn refresh_update_snapshots(
+    client: &Arc<tokio::sync::Mutex<Option<JiraClient>>>,
+    cfg: &JiraConfig,
+    items: &Arc<Mutex<Vec<ProposalItem>>>,
+) {
+    let pending: Vec<(i32, String)> = {
+        let guard = items.lock().unwrap();
+        guard
+            .iter()
+            .filter(|it| {
+                it.proposal.action == ProposalAction::Update
+                    && !it.proposal.target_key.trim().is_empty()
+                    && it.current.is_none()
+            })
+            .map(|it| (it.id, it.proposal.target_key.clone()))
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    if ensure_client(client, cfg).await.is_err() {
+        return;
+    }
+
+    let guard = client.lock().await;
+    let Some(c) = guard.as_ref() else { return };
+
+    for (id, key) in pending {
+        if let Ok(snapshot) = c.get_issue_fields_snapshot(&key).await {
+            let mut g = items.lock().unwrap();
+            if let Some(it) = g.iter_mut().find(|x| x.id == id) {
+                it.current = Some(snapshot);
+            }
+        }
+    }
+}
+
 /// Build a fuzzy JQL query to find an existing issue matching a proposal summary,
 /// scoped to `project` when provided. Prefers the most recently updated match.
 fn build_update_search_jql(summary: &str, project: &str) -> String {
@@ -842,6 +987,12 @@ async fn apply_proposal(
     let c = guard.as_ref().ok_or("Jira client unavailable")?;
 
     let description = full_description(proposal);
+    let fields = jira_client::IssueFields {
+        priority: proposal.priority.clone(),
+        labels: proposal.labels.clone(),
+        assignee: proposal.assignee.clone(),
+        sprint: proposal.sprint.clone(),
+    };
 
     match proposal.action {
         ProposalAction::Create => {
@@ -851,7 +1002,7 @@ async fn apply_proposal(
                 project_key
             };
             let result = c
-                .create_issue(project, &proposal.issue_type, &proposal.summary, &description)
+                .create_issue(project, &proposal.issue_type, &proposal.summary, &description, &fields)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
             let key = created_key(&result).unwrap_or_else(|| "(unknown key)".to_string());
@@ -862,7 +1013,7 @@ async fn apply_proposal(
             if key.is_empty() {
                 return Err("Update proposal has no target issue key".to_string());
             }
-            c.edit_issue(key, &proposal.summary, &proposal.description)
+            c.edit_issue(key, &proposal.summary, &proposal.description, &fields)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
 
@@ -897,9 +1048,15 @@ mod tests {
                 description: "Users can reset their password via an emailed link.".to_string(),
                 acceptance_criteria: String::new(),
                 rationale: String::new(),
+                priority: String::new(),
+                labels: Vec::new(),
+                assignee: String::new(),
+                sprint: String::new(),
             },
             status: status.to_string(),
             result: String::new(),
+            current: None,
+            selected: false,
         }
     }
 
@@ -912,6 +1069,10 @@ mod tests {
             description: description.to_string(),
             acceptance_criteria: String::new(),
             rationale: String::new(),
+            priority: String::new(),
+            labels: Vec::new(),
+            assignee: String::new(),
+            sprint: String::new(),
         }
     }
 
@@ -978,5 +1139,41 @@ mod tests {
         let rendered = render_cached_for_prompt(&items);
         assert!(rendered.contains("Add password reset"));
         assert!(!rendered.contains("Trim onboarding epic"));
+    }
+
+    #[test]
+    fn to_proposal_view_maps_new_fields_and_selection() {
+        let mut it = item(1, ProposalAction::Update, "PROJ-57", "Refine story", "pending");
+        it.proposal.priority = "High".to_string();
+        it.proposal.labels = vec!["auth".to_string(), "backend".to_string()];
+        it.proposal.assignee = "alice".to_string();
+        it.proposal.sprint = "Sprint 5".to_string();
+        it.selected = true;
+        it.current = Some(jira_client::IssueSnapshot {
+            summary: "Old summary".to_string(),
+            description: "Old description".to_string(),
+            priority: "Medium".to_string(),
+            labels: vec!["onboarding".to_string()],
+            assignee: "bob".to_string(),
+            sprint: "Sprint 4".to_string(),
+        });
+
+        let view = to_proposal_view(&it);
+        assert_eq!(view.priority, "High");
+        assert_eq!(view.labels, "auth, backend");
+        assert_eq!(view.assignee, "alice");
+        assert_eq!(view.sprint, "Sprint 5");
+        assert!(view.selected);
+        assert_eq!(view.current_summary.as_deref(), Some("Old summary"));
+        assert_eq!(view.current_priority.as_deref(), Some("Medium"));
+        assert_eq!(view.current_labels.as_deref(), Some("onboarding"));
+    }
+
+    #[test]
+    fn to_proposal_view_has_no_current_snapshot_for_create() {
+        let it = item(1, ProposalAction::Create, "", "Add reset", "pending");
+        let view = to_proposal_view(&it);
+        assert!(view.current_summary.is_none());
+        assert!(view.current_priority.is_none());
     }
 }

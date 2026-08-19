@@ -6,6 +6,7 @@
 //! a few convenience structs for the pieces the UI needs.
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -19,6 +20,29 @@ pub struct IssueSummary {
     pub summary: String,
     pub issue_type: String,
     pub status: String,
+}
+
+/// The extra (beyond summary/description) fields a create/update can carry.
+/// All are optional; empty/blank values are omitted from the Jira request so
+/// existing values aren't accidentally cleared.
+#[derive(Clone, Debug, Default)]
+pub struct IssueFields {
+    pub priority: String,
+    pub labels: Vec<String>,
+    pub assignee: String,
+    pub sprint: String,
+}
+
+/// A snapshot of an existing issue's current field values, used to render an
+/// old→new diff for update proposals before they're applied.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IssueSnapshot {
+    pub summary: String,
+    pub description: String,
+    pub priority: String,
+    pub labels: Vec<String>,
+    pub assignee: String,
+    pub sprint: String,
 }
 
 /// Connected, Jira-aware MCP client with a cached cloudId.
@@ -101,6 +125,13 @@ impl JiraClient {
             .with_context(|| format!("fetching issue {key}"))
     }
 
+    /// Fetch and parse an issue's current field values, for diffing against a
+    /// proposed update before it's applied.
+    pub async fn get_issue_fields_snapshot(&self, key: &str) -> Result<IssueSnapshot> {
+        let payload = self.get_issue(key).await?;
+        Ok(parse_issue_snapshot(&payload))
+    }
+
     /// Create a new issue. Returns the raw create result (contains the new key).
     pub async fn create_issue(
         &self,
@@ -108,36 +139,45 @@ impl JiraClient {
         issue_type: &str,
         summary: &str,
         description: &str,
+        fields: &IssueFields,
     ) -> Result<Value> {
         let cloud_id = self.cloud_id().await?;
+        let mut args = json!({
+            "cloudId": cloud_id,
+            "projectKey": project_key,
+            "issueTypeName": issue_type,
+            "summary": summary,
+            "description": description,
+        });
+        merge_extra_fields(&mut args, fields);
         self.mcp
-            .call_tool(
-                "createJiraIssue",
-                json!({
-                    "cloudId": cloud_id,
-                    "projectKey": project_key,
-                    "issueTypeName": issue_type,
-                    "summary": summary,
-                    "description": description,
-                }),
-            )
+            .call_tool("createJiraIssue", args)
             .await
             .with_context(|| format!("creating {issue_type} in {project_key}"))
     }
 
-    /// Edit an existing issue's summary/description.
-    pub async fn edit_issue(&self, key: &str, summary: &str, description: &str) -> Result<Value> {
+    /// Edit an existing issue's summary/description plus any optional extra
+    /// fields (priority/labels/assignee/sprint) that were provided.
+    pub async fn edit_issue(
+        &self,
+        key: &str,
+        summary: &str,
+        description: &str,
+        fields: &IssueFields,
+    ) -> Result<Value> {
         let cloud_id = self.cloud_id().await?;
+        let mut field_obj = json!({
+            "summary": summary,
+            "description": description,
+        });
+        merge_extra_fields(&mut field_obj, fields);
         self.mcp
             .call_tool(
                 "editJiraIssue",
                 json!({
                     "cloudId": cloud_id,
                     "issueIdOrKey": key,
-                    "fields": {
-                        "summary": summary,
-                        "description": description,
-                    },
+                    "fields": field_obj,
                 }),
             )
             .await
@@ -167,6 +207,51 @@ pub fn created_key(value: &Value) -> Option<String> {
         .get("key")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Merge non-empty [`IssueFields`] into a Jira `fields`-shaped JSON object,
+/// omitting blank values so existing Jira data isn't accidentally cleared.
+fn merge_extra_fields(target: &mut Value, fields: &IssueFields) {
+    let Some(obj) = target.as_object_mut() else { return };
+    if !fields.priority.trim().is_empty() {
+        obj.insert("priority".to_string(), json!({ "name": fields.priority }));
+    }
+    if !fields.labels.is_empty() {
+        obj.insert("labels".to_string(), json!(fields.labels));
+    }
+    if !fields.assignee.trim().is_empty() {
+        obj.insert("assignee".to_string(), json!({ "name": fields.assignee }));
+    }
+    if !fields.sprint.trim().is_empty() {
+        // Sprint is a per-instance custom field in real Jira; the MCP server
+        // is expected to resolve it by name via this generic key.
+        obj.insert("sprint".to_string(), json!(fields.sprint));
+    }
+}
+
+/// Parse a `getJiraIssue` payload into an [`IssueSnapshot`] of current values.
+fn parse_issue_snapshot(payload: &Value) -> IssueSnapshot {
+    let fields = payload.get("fields");
+    let str_field = |path: &[&str]| -> String {
+        let mut node = fields;
+        for p in path {
+            node = node.and_then(|n| n.get(*p));
+        }
+        node.and_then(Value::as_str).unwrap_or("").to_string()
+    };
+    let labels = fields
+        .and_then(|f| f.get("labels"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    IssueSnapshot {
+        summary: str_field(&["summary"]),
+        description: str_field(&["description"]),
+        priority: str_field(&["priority", "name"]),
+        labels,
+        assignee: str_field(&["assignee", "name"]),
+        sprint: str_field(&["sprint"]),
+    }
 }
 
 /// Parse a `searchJiraIssuesUsingJql` payload into [`IssueSummary`] rows.
@@ -228,15 +313,34 @@ mod tests {
         let issue = client.get_issue("PROJ-57").await.unwrap();
         assert_eq!(issue.get("key").and_then(|v| v.as_str()), Some("PROJ-57"));
 
+        // Snapshot parses current field values for diffing.
+        let snapshot = client.get_issue_fields_snapshot("PROJ-57").await.unwrap();
+        assert_eq!(snapshot.priority, "Medium");
+        assert_eq!(snapshot.labels, vec!["onboarding".to_string()]);
+        assert_eq!(snapshot.assignee, "Bob");
+
         // Create returns a new key.
         let created = client
-            .create_issue("PROJ", "Story", "New story", "desc")
+            .create_issue("PROJ", "Story", "New story", "desc", &IssueFields::default())
             .await
             .unwrap();
         assert_eq!(created_key(&created).as_deref(), Some("PROJ-1001"));
 
-        // Edit + comment succeed.
-        client.edit_issue("PROJ-57", "s", "d").await.unwrap();
+        // Create with extra fields still succeeds (mock ignores request shape).
+        let fields = IssueFields {
+            priority: "High".to_string(),
+            labels: vec!["auth".to_string()],
+            assignee: "alice".to_string(),
+            sprint: "Sprint 4".to_string(),
+        };
+        client
+            .create_issue("PROJ", "Story", "New story", "desc", &fields)
+            .await
+            .unwrap();
+
+        // Edit + comment succeed, with and without extra fields.
+        client.edit_issue("PROJ-57", "s", "d", &IssueFields::default()).await.unwrap();
+        client.edit_issue("PROJ-57", "s", "d", &fields).await.unwrap();
         client.add_comment("PROJ-57", "note").await.unwrap();
     }
 }

@@ -25,8 +25,11 @@ short sentences.";
 /// fits in the context window.
 const SUMMARIZER_PROMPT: &str =
     "You are maintaining running notes of a spoken conversation. Update the summary \
-to incorporate the new transcript excerpt. Keep it concise and factual (a few \
-sentences at most); preserve decisions, action items, names, dates and numbers.";
+to incorporate the new transcript excerpt. Keep it concise and factual, but list \
+EVERY distinct decision or action item as its own separate bullet point - never \
+merge unrelated asks (e.g. an edit to one existing item and the creation of a new, \
+different item) into a single sentence or bullet. Preserve decisions, action \
+items, names, dates and numbers for each bullet.";
 
 /// Extra tokens reserved for prompt scaffolding (INST markers, system prompt, labels).
 const SCAFFOLD_RESERVE: usize = 96;

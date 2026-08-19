@@ -23,9 +23,24 @@ pub struct ProposalView {
     pub description: String,
     pub acceptance_criteria: String,
     pub rationale: String,
+    pub priority: String,
+    /// Comma-separated labels for display/editing.
+    pub labels: String,
+    pub assignee: String,
+    pub sprint: String,
+    /// Bulk-selection checkbox state.
+    pub selected: bool,
     /// "pending" | "approved" | "rejected" | "applied" | "error".
     pub status: String,
     pub result: String,
+    /// Current field values fetched from Jira for `update` proposals, used to
+    /// render an old→new diff. `None` when not yet fetched (or a create).
+    pub current_summary: Option<String>,
+    pub current_description: Option<String>,
+    pub current_priority: Option<String>,
+    pub current_labels: Option<String>,
+    pub current_assignee: Option<String>,
+    pub current_sprint: Option<String>,
 }
 
 /// Messages pushed from backend threads/tasks into the UI. Consumed by a task
@@ -317,6 +332,27 @@ pub fn AppJira() -> Element {
                     style: "color: #888;",
                     "No proposals yet. They appear automatically as the discussion grows."
                 }
+            } else {
+                div {
+                    style: "display: flex; gap: 8px;",
+                    button {
+                        class: "vp-button vp-button--small",
+                        onclick: {
+                            let backend = backend.clone();
+                            let project_key = project_key;
+                            move |_| backend.approve_selected(project_key.peek().clone())
+                        },
+                        "✅ Approve selected"
+                    }
+                    button {
+                        class: "vp-button vp-button--small vp-button--negative",
+                        onclick: {
+                            let backend = backend.clone();
+                            move |_| backend.reject_selected()
+                        },
+                        "🗑️ Reject selected"
+                    }
+                }
             }
 
             div {
@@ -358,9 +394,17 @@ fn ProposalCard(proposal: ProposalView) -> Element {
         div {
             style: "background: {bg}; border: 1px solid #e0e0e0; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 4px;",
 
-            // Header row: action + type + target
+            // Header row: checkbox + action + type + target
             div {
                 style: "display: flex; align-items: center; gap: 8px; flex-wrap: wrap;",
+                input {
+                    r#type: "checkbox",
+                    checked: proposal.selected,
+                    onchange: {
+                        let backend = backend.clone();
+                        move |evt: FormEvent| backend.toggle_selected(id, evt.checked())
+                    }
+                }
                 span {
                     style: "font-weight: 700; color: {action_color};",
                     "{action_label}"
@@ -386,6 +430,10 @@ fn ProposalCard(proposal: ProposalView) -> Element {
                         move |evt| update_field("target_key", evt.value())
                     }
                 }
+            }
+
+            if is_update && proposal.current_summary.is_some() {
+                DiffBlock { proposal: proposal.clone() }
             }
 
             span { style: "font-size: 12px; color: #666;", "Summary" }
@@ -417,6 +465,56 @@ fn ProposalCard(proposal: ProposalView) -> Element {
                 oninput: {
                     let update_field = update_field.clone();
                     move |evt| update_field("acceptance_criteria", evt.value())
+                }
+            }
+
+            div {
+                style: "display: flex; gap: 8px; flex-wrap: wrap;",
+                div {
+                    style: "flex: 1; min-width: 100px;",
+                    span { style: "font-size: 12px; color: #666;", "Priority" }
+                    input {
+                        class: "vp-input vp-input--small",
+                        value: "{proposal.priority}",
+                        oninput: {
+                            let update_field = update_field.clone();
+                            move |evt| update_field("priority", evt.value())
+                        }
+                    }
+                }
+                div {
+                    style: "flex: 1; min-width: 100px;",
+                    span { style: "font-size: 12px; color: #666;", "Assignee" }
+                    input {
+                        class: "vp-input vp-input--small",
+                        value: "{proposal.assignee}",
+                        oninput: {
+                            let update_field = update_field.clone();
+                            move |evt| update_field("assignee", evt.value())
+                        }
+                    }
+                }
+                div {
+                    style: "flex: 1; min-width: 100px;",
+                    span { style: "font-size: 12px; color: #666;", "Sprint" }
+                    input {
+                        class: "vp-input vp-input--small",
+                        value: "{proposal.sprint}",
+                        oninput: {
+                            let update_field = update_field.clone();
+                            move |evt| update_field("sprint", evt.value())
+                        }
+                    }
+                }
+            }
+
+            span { style: "font-size: 12px; color: #666;", "Labels (comma-separated)" }
+            input {
+                class: "vp-input",
+                value: "{proposal.labels}",
+                oninput: {
+                    let update_field = update_field.clone();
+                    move |evt| update_field("labels", evt.value())
                 }
             }
 
@@ -461,6 +559,57 @@ fn ProposalCard(proposal: ProposalView) -> Element {
                             move |_| backend.reject_proposal(id)
                         },
                         "🗑️ Reject"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Renders an old→new diff for each changed field of an `update` proposal,
+/// using the snapshot fetched from Jira before the change is applied. Only
+/// fields that actually differ are shown; unchanged fields are omitted to
+/// keep the card compact.
+#[component]
+fn DiffBlock(proposal: ProposalView) -> Element {
+    let rows: Vec<(&'static str, String, String)> = [
+        ("Summary", proposal.current_summary.clone(), proposal.summary.clone()),
+        ("Description", proposal.current_description.clone(), proposal.description.clone()),
+        ("Priority", proposal.current_priority.clone(), proposal.priority.clone()),
+        ("Labels", proposal.current_labels.clone(), proposal.labels.clone()),
+        ("Assignee", proposal.current_assignee.clone(), proposal.assignee.clone()),
+        ("Sprint", proposal.current_sprint.clone(), proposal.sprint.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(label, old, new)| {
+        let old = old.unwrap_or_default();
+        if old.trim() == new.trim() {
+            None
+        } else {
+            Some((label, old, new))
+        }
+    })
+    .collect();
+
+    if rows.is_empty() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div {
+            style: "background: #fffbea; border: 1px solid #f0e0a0; border-radius: 4px; padding: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 4px;",
+            span { style: "font-weight: 600; color: #7a5c00;", "Changes vs. current Jira value" }
+            for (label, old, new) in rows {
+                div {
+                    style: "display: flex; flex-direction: column;",
+                    span { style: "color: #999; font-weight: 600;", "{label}" }
+                    span {
+                        style: "color: #b71c1c; text-decoration: line-through;",
+                        if old.is_empty() { "(empty)" } else { "{old}" }
+                    }
+                    span {
+                        style: "color: #2e7d32;",
+                        if new.is_empty() { "(empty)" } else { "{new}" }
                     }
                 }
             }

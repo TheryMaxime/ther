@@ -231,7 +231,11 @@ fn mock_tool(name: &str, arguments: &Value) -> Value {
                     "summary": "As a user I can reset my password",
                     "description": "Existing story under the onboarding epic.",
                     "issuetype": { "name": "Story" },
-                    "status": { "name": "To Do" }
+                    "status": { "name": "To Do" },
+                    "priority": { "name": "Medium" },
+                    "labels": ["onboarding"],
+                    "assignee": { "name": "Bob" },
+                    "sprint": "Sprint 3"
                 }
             })
         }
